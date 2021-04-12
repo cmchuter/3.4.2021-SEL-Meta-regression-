@@ -1,0 +1,1098 @@
+
+
+```{r}
+########################################################################################################
+# Load data
+########################################################################################################
+# set up to load from Google
+drive_auth(email = "cmchuter@gmail.com")
+id <- drive_find(pattern = "SEL tracking", type = "spreadsheet")$id[1]
+
+# load findings and studies
+gs4_auth(email = "cmchuter@gmail.com")
+findings <- read_sheet(id, sheet = "10.5.2020_Outcome Coding", col_types = "c")
+studies <- read_sheet(id, sheet = "Study Coding", col_types = "c")   # includes separate effect sizes for each finding from a study
+
+rm(id)
+```
+
+
+```{r}
+########################################################################################################
+# Clean data
+########################################################################################################
+# remove any empty rows & columns
+findings <- remove_empty(findings, which = c("rows", "cols"))
+studies <- remove_empty(studies, which = c("rows", "cols"))
+
+# limit to relevant columns
+studies <- studies[c("Second Reviewer", "Reviewer", "Include_E4E", "Year", "APA", "APA7", "Intervention", "Study No.", "Type", 
+                     "Targeted Population", "Design", "Design_forced", "Grade", "Duration", "Country", "Sample Description")]
+findings <- findings[c("Second Reviewer", "First Reviewer", "APA", "Intervention", 
+                       "Study No.", "Tx.\nCluster", "Control.\nCluster", "Unit of Cluster", 
+                       "Tx.N", "Control.N", 
+                       "Website Category (academic, emotion, relations, problem behavior)", 
+                       "Website Subcategory", 
+                       "Outcome (measure)", "Description of measure", "Outcome_desc",
+                       "MOOSES Rating", 
+                       "ES2", 
+                       "Significant2", "Type of Measure", "Self- Report", "baseline")]
+
+# rename columns
+studies <- rename(studies, c("APA7" = "Citation", "APA" = "Identifier", "Study No." = "StudyID", 
+                             "Sample Description" = "sample_desc", "Intervention" = "Program", "Targeted Population" = "uni_target"))
+
+findings <- rename(findings, c("MOOSES Rating" = "mooses", 
+                                "APA" = "Identifier", "Study No." = "StudyID", 
+                               "Tx.\nCluster" = "Treatment.Cluster", "Control.\nCluster" = "Control.Cluster", 
+                               "Unit of Cluster" = "cluster.unit", "Tx.N" = "Treatment.N", 
+                               "Website Category (academic, emotion, relations, problem behavior)" = "category", 
+                               "Website Subcategory" = "subcategory",
+                               "Outcome_desc" = "Outcome_desc", "Outcome (measure)" = "Outcome_measure", 
+                               "Description of measure" = "measure_desc", "Intervention" = "Program",
+                               "ES2" = "Effect.Size", 
+                               "Significant2" = "significant", "Type of Measure" = "measure_type", "Self- Report" = "self_report"))
+
+# merge dataframes
+full <- merge(studies, findings, by = c("Identifier", "Program", "StudyID"), all = TRUE, suffixes = c(".s", ".f"))
+```
+```{r}
+# next drop if isn't appropriate mooses level
+full <- subset(full, full$mooses != "2?")
+full <- subset(full, full$mooses != "2b")
+full <- subset(full, full$mooses != "2? need more info")
+full <- subset(full, full$mooses != "need more info")
+# drop if ES is missing
+full <- subset(full, is.na(full$Effect.Size) == FALSE)
+# drop if category isn't coded
+full <- subset(full, full$subcategory != "Unsure")
+
+# cleaning up mis-coded
+full$self_report[which(full$self_report=="yes")] <- "Yes"
+
+# reformat columns as necessary
+fact<-c("Program")
+full[fact] <- lapply(full[fact], as.factor)
+rm(fact)
+num <- c("Treatment.Cluster", "Control.Cluster", "Treatment.N", "Control.N", "Effect.Size")
+full[num] <- lapply(full[num], as.numeric)
+rm(num)
+
+```
+
+
+```{r}
+########################################################################################################
+# Prep data: create variables for analyses
+########################################################################################################
+full$ProgramID <- full$Program
+full$ProgramID <- as.numeric(as.factor(full$ProgramID))
+full$EffectSizeID <- as.numeric(row.names(full))
+full$StudyID.orig <- full$StudyID
+full$StudyID <- as.numeric(as.factor(paste(full$Program, full$StudyID.orig, sep = ":")))
+
+full$Clustered <- 0
+full$Clustered[which(full$Design_forced == "Cluster quasi-experiment" | full$Design_forced == "Cluster randomized")] <- 1
+full$Randomized <- 0
+full$Randomized[which(full$Design_forced == "Cluster randomized" | full$Design_forced == "Student randomized")] <- 1
+
+# create full sample/total clusters variables
+full$Sample <- full$Treatment.N + full$Control.N
+full$Clusters_Total <- full$Treatment.Cluster + full$Control.Cluster
+
+### create meta-analysis variables
+#calculate standard errors
+full$se<-sqrt(((full$Treatment.N+full$Control.N)/(full$Treatment.N*full$Control.N))+((full$Effect.Size*full$Effect.Size)/(2*(full$Treatment.N+full$Control.N))))
+
+#calculate variance
+full$var<-full$se*full$se
+
+# calculate cluster-corrected variance
+# correct for clustering
+full$icc <- NA
+full$icc[which(full$Clustered == 1)] <- 0.1   # could look this up and specify
+
+full$Treatment.Cluster.n <- NA
+full$Treatment.Cluster.n[which(full$Clustered == 1)] <- round(full$Treatment.N[which(full$Clustered == 1)]/full$Treatment.Cluster[which(full$Clustered == 1)], 0)
+full$Control.Cluster.n <- NA
+full$Control.Cluster.n[which(full$Clustered == 1)] <- round(full$Control.N[which(full$Clustered == 1)]/full$Control.Cluster[which(full$Clustered == 1)], 0)
+
+full$ntilde <- NA
+full$ntilde <- ((full$Control.N * full$Treatment.Cluster * full$Treatment.Cluster.n * full$Treatment.Cluster.n)/(full$Treatment.N * full$Sample)) +
+  ((full$Treatment.N * full$Control.Cluster * full$Control.Cluster.n * full$Control.Cluster.n)/(full$Control.N * full$Sample))
+
+full$n.TU <- NA
+full$n.TU <- ((full$Treatment.N * full$Treatment.N) - (full$Treatment.Cluster * full$Treatment.Cluster.n * full$Treatment.Cluster.n))/(full$Treatment.N * (full$Treatment.Cluster - 1))
+full$n.CU <- NA
+full$n.CU <- ((full$Control.N * full$Control.N) - (full$Control.Cluster * full$Control.Cluster.n * full$Control.Cluster.n))/(full$Control.N * (full$Control.Cluster - 1))
+
+full$AT <- NA
+full$AT <-((full$Treatment.N^2 * full$Treatment.Cluster * full$Treatment.Cluster.n^2) + ((full$Treatment.Cluster * full$Treatment.Cluster.n^2)^2) - (2 * full$Treatment.N * full$Treatment.Cluster.n^3 * full$Treatment.Cluster))/(full$Treatment.N^2)
+
+full$AC <- NA
+full$AC <-((full$Control.N^2 * full$Control.Cluster * full$Control.Cluster.n^2) + ((full$Control.Cluster * full$Control.Cluster.n^2)^2) - (2 * full$Control.N * full$Control.Cluster.n^3 * full$Control.Cluster))/(full$Control.N^2)
+
+full$A <- full$AT + full$AC
+
+full$B <- NA
+full$B <- full$n.TU * (full$Treatment.Cluster - 1) + full$n.CU * (full$Control.Cluster -1)
+
+full$var.adj <- NA
+full$var.adj <- ((full$Treatment.N + full$Control.N)/(full$Treatment.N * full$Control.N)) * (1 + (full$ntilde - 1) * full$icc) + ((((full$Sample - 2)*(1-full$icc)^2) + full$A * full$icc^2 + 2*full$icc*(1-full$icc))*full$Effect.Size^2)/(2*(full$Sample-2)*((full$Sample - 2)-full$icc*(full$Sample-2-full$B)))
+full$var.old <- full$var
+full$var[which(full$Clustered == 1)] <- full$var.adj[which(full$Clustered == 1)]
+
+# alphabetize by program
+full <- full[order(full$Program, full$StudyID, full$category, full$subcategory),]
+```
+
+```{r}
+# create dummies
+full$targeted <- 0
+full$targeted[which(full$uni_target=="Targeted")] <- 1
+
+# "Randomized" is already a dummy
+
+# Make MOOSES variable a dummy (with three categories: 1/2, 3/4, 5)
+full$Mooses.low <- 0
+full$Mooses.low[which(full$mooses=="1")] <- 1
+full$Mooses.low[which(full$mooses=="2")] <- 1
+
+full$Mooses.middle <- 0
+full$Mooses.middle[which(full$mooses=="3")] <- 1
+full$Mooses.middle[which(full$mooses=="4")] <- 1
+full$Mooses.middle[which(full$mooses=="4a")] <- 1
+full$Mooses.middle[which(full$mooses=="4b")] <- 1
+
+full$Mooses.high <- 0
+full$Mooses.high[which(full$mooses=="5")] <- 1
+
+acad <- subset(full, full$category=="Academic")
+prob <- subset(full, full$category=="Problem Behaviors")
+relat <- subset(full, full$category=="Social Relationships")
+emot <- subset(full, full$category=="Emotional Well-being")
+
+```
+
+```{r}
+  ########################################################################################################
+  # Descriptives
+  ########################################################################################################
+  # number of programs:
+  print(length(unique(df$Program)))
+
+  # make aggregated versions of data for study-level descriptives
+  df_agg <- df[c("StudyID", "uni_target", "Randomized", "Clustered")]
+  df_agg <- df_agg[!duplicated(df_agg$StudyID), ]
+  
+  # identify variables for descriptive tables (study-level and outcome-level)
+  vars_study <- c("uni_target", "Randomized", "Clustered")
+  vars_outcome <- c( "self_report")
+  
+  # create the table "chunks"
+  table_study_df <- as.data.frame(print(CreateTableOne(vars = vars_study, data = df_agg, includeNA = TRUE, factorVars = vars_study), showAllLevels = TRUE))
+  table_outcome_df <- as.data.frame(print(CreateTableOne(vars = vars_outcome, data = df, includeNA = TRUE), showAllLevels = TRUE))
+
+  ########################################################################################################
+  # Meta-Regression
+  ########################################################################################################
+  ### calculate null model ###
+  V_list <- impute_covariance_matrix(vi = df$var,  #known correlation vector
+                                     cluster = df$StudyID, #study ID
+                                     r = 0.70) #assumed correlation 
+  
+  null <- rma.mv(yi=Effect.Size, #effect size
+                 V = V_list, #variance (tHIS IS WHAt CHANGES FROM HEmodel)
+                 random = ~1 | StudyID/EffectSizeID, #nesting structure
+                 test= "t", #use t-tests
+                 data=df, #define data
+                 method="REML") #estimate variances using REML
+  coef_null <- coef_test(null,#estimation model above
+                         cluster=df$StudyID, #define cluster IDs
+                         vcov = "CR2") #estimation method (CR2 is best)
+  # number of studies:
+  null$s.nlevels[1]
+  
+  # number of effect sizes:
+  null$s.nlevels[2]
+  
+  ### Centered model for mean overall effect size and model table results ###
+  mod_c <- suppressWarnings(rma.mv(yi=Effect.Size, #effect size
+                                   V = V_list, #variance (tHIS IS WHAt CHANGES FROM HEmodel)
+                                   mods = ~ Mooses.middle.c + Mooses.high.c +self.report.c +teacher.report.c +parent.report.c +peer.report.c + academic.c+ secondary.c  + targeted.c + Randomized.c + Clustered.c, #ADD COVS HERE
+                                   random = ~1 | StudyID/EffectSizeID, #nesting structure
+                                   test= "t", #use t-tests
+                                   data=df, #define data
+                                   method="REML")) #estimate variances using REML
+  
+  coef_mod_c<- coef_test(mod_c,#estimation model above
+                         cluster=df$StudyID, #define cluster IDs
+                         vcov = "CR2") #estimation method (CR2 is best)
+  
+  ### re-run model to get marginal means for each moderator ###
+  means <- data.frame(moderator = character(0), group = character(0), beta = numeric(0), SE = numeric(0), 
+                      tstat = numeric(0), df = numeric(0), p_Satt = numeric(0))
+  
+  terms <- c("Mooses.middle.c", "Mooses.high.c","self.report.c", "teacher.report.c", "parent.report.c","peer.report.c","secondary.c", "targeted.c",  "Randomized.c", "Clustered.c")
+  mods <- c( "as.factor(targeted)", 
+             "as.factor(Randomized)", "as.factor(Clustered)")
+  for(i in 1:length(mods)){
+    # i <- 1
+    formula <- reformulate(termlabels = c(mods[i], terms, "-1"))
+    mod_means <- suppressWarnings(rma.mv(yi=Effect.Size, #effect size
+                                         V = V_list, #variance (tHIS IS WHAt CHANGES FROM HEmodel)
+                                         mods = formula, #ADD COVS HERE
+                                         random = ~1 | StudyID/EffectSizeID, #nesting structure
+                                         test= "t", #use t-tests
+                                         data=df, #define data
+                                         method="REML")) #estimate variances using REML
+    coef_mod_means <- as.data.frame(coef_test(mod_means,#estimation model above
+                                              cluster=df$StudyID, #define cluster IDs
+                                              vcov = "CR2")) #estimation method (CR2 is best)
+    # limit to relevant rows (the means you are interested in)
+    coef_mod_means$moderator <- gsub(x = mods[i], pattern = "as.factor", replacement = "")
+    coef_mod_means$group <- rownames(coef_mod_means)
+    rownames(coef_mod_means) <- c()
+    coef_mod_means <- subset(coef_mod_means, substr(start = 1, stop = nchar(mods[i]), x = coef_mod_means$group)== mods[i])
+    coef_mod_means$group <- substr(x = coef_mod_means$group, start = nchar(mods[i])+1, stop = nchar(coef_mod_means$group))
+    means <- dplyr::bind_rows(means, coef_mod_means)
+  }
+  
+  ########################################################################################################
+  # Visualization
+  ########################################################################################################
+  # 95% prediction intervals
+  PI_upper <- mod_c$b[1] + (1.96*sqrt(mod_c$sigma2[1] + mod_c$sigma2[2]))
+  PI_lower <- mod_c$b[1] - (1.96*sqrt(mod_c$sigma2[1] + mod_c$sigma2[2]))
+  
+  print(paste("95% PI: ", name, ": ", format(round(PI_lower, 2), nsmall=2), " - ", format(round(PI_upper, 2), nsmall=2), sep = ""))
+  
+  # Get empirical bayes estimates of each effect size
+  blup_mod <- ranef(mod_c)
+  df$blup_ES <- blup_mod$`StudyID/EffectSizeID`$intrcpt
+
+  blup_Study <- blup_mod$StudyID
+  blup_Study$StudyID <- as.numeric(row.names(data.frame(blup_Study)))
+  
+  fixed_ES <- predict(mod_c)
+  fixed_ES <- as.data.frame(fixed_ES$pred)
+  fixed_ES$StudyID <- as.numeric(row.names(data.frame(fixed_ES)))
+  
+  #now merge Study.ID blups into data
+  data_m <- merge(df, blup_Study, by = "StudyID")
+  data_m <- merge(data_m, fixed_ES, by = "StudyID")
+  
+  #put together to get EB: fixed + Study BLUP + ES BLUP
+  data_m$grandmean <- as.numeric(coef(mod_c)[1])
+  
+  data_m$blup_all <- data_m$grandmean + data_m$blup_ES + data_m$intrcpt
+  # this section combines all 3 pieces
+  
+  k = length(data_m$Effect.Size)# number of studies
+  #create a dataframe with observed effect sizes and emprical bayes estimates
+
+  ES_EB = data.frame(es = c(data_m$Effect.Size, data_m$blup_all), type = rep(c('Observed', 'Empirical Bayes'), each = k))
+  ES_EB$type = factor(ES_EB$type, levels = c('Observed', 'Empirical Bayes'))
+  
+  library(ggplot2)
+  
+  ggplot(data_m, aes(x=Effect.Size)) +
+    geom_rect(aes(xmin=PI_lower, xmax=PI_upper, ymin=-Inf, ymax=Inf), alpha=0.01, fill="green") +
+    geom_histogram(binwidth = .05) 
+
+  # ggplot(data_m, aes(x=Effect.Size)) +
+  #   geom_rect(aes(xmin=PI_lower, xmax=PI_upper, ymin=-Inf, ymax=Inf), alpha=0.01, fill="green") +
+  #   geom_histogram(aes(y = ..density..), binwidth = .05) + 
+  #   geom_density()
+  
+  ggplot(ES_EB) + 
+    stat_density(aes(es, group = type, colour = type), geom="line",position="identity", size=1) +
+    geom_vline(aes(xintercept = coef(mod_c)[1]), color="black", linetype="dashed") + 
+    labs(x = 'Effect Sizes', y = 'Density', title = 'Distribution of Effect Sizes') + 
+    expand_limits(x=c(-1,2), y=c(0,2.7)) + 
+    theme(
+      plot.title = element_text(color="black", size=14, face="bold", hjust = 0.5),
+      axis.title.x = element_text(color="black", size=12, face="bold"),
+      axis.title.y = element_text(color="black", size=12, face="bold"),
+      legend.position = c(.95, .95),
+      legend.justification = c("right", "top"),
+      legend.box.just = "right",
+      legend.margin = margin(0, 2, 2, 2),
+      legend.title = element_blank(),
+      legend.text=element_text(size=9, face="bold")
+    )
+  
+  ########################################################################################################
+  # Format Output
+  ########################################################################################################
+  # Descriptives Table
+  table_study_df$Category <- row.names(table_study_df)
+  rownames(table_study_df) <- c()
+  table_study_df <- table_study_df[c("Category", "level", "Overall")]
+  table_study_df$Category[which(substr(table_study_df$Category, 1, 1)=="X")] <- NA
+  table_study_df$Category <- gsub(pattern = "\\..mean..SD..", replacement = "", x = table_study_df$Category)
+  table_study_df$Overall <- gsub(pattern = "\\( ", replacement = "\\(", x = table_study_df$Overall)
+  table_study_df$Overall <- gsub(pattern = "\\) ", replacement = "\\)", x = table_study_df$Overall)
+  table_study_df$Category <- gsub(pattern = "\\....", replacement = "", x = table_study_df$Category)
+  table_study_df$Category[which(table_study_df$Category=="n")] <- "Total Studies"
+  
+  table_outcome_df$Category <- row.names(table_outcome_df)
+  rownames(table_outcome_df) <- c()
+  table_outcome_df <- table_outcome_df[c("Category", "level", "Overall")]
+  table_outcome_df$Category[which(substr(table_outcome_df$Category, 1, 1)=="X")] <- NA
+  table_outcome_df$Overall <- gsub(pattern = "\\( ", replacement = "\\(", x = table_outcome_df$Overall)
+  table_outcome_df$Overall <- gsub(pattern = "\\) ", replacement = "\\)", x = table_outcome_df$Overall)
+  table_outcome_df$Category <- gsub(pattern = "\\....", replacement = "", x = table_outcome_df$Category)
+  table_outcome_df$Category[which(table_outcome_df$Category=="n")] <- "Total Effect Sizes"
+  table_outcome_df$Category[which(table_outcome_df$Category=="targeted")] <- "Population"
+  
+  # Meta-Regression
+  coef_null$coef <- row.names(coef_null)
+  coef_null$`Reference Group` <- ""
+  coef_null <- coef_null[c("coef", "Reference Group", "beta", "SE", "tstat", "df", "p_Satt")]
+  coef_null$coef[which(coef_null$coef=="intrcpt")] <- "Intercept"
+  coef_null <- plyr::rename(coef_null, c("coef" = "Coefficients", "tstat" = "t", "p_Satt" = "p"))
+   
+  coef_mod_c$coef <- row.names(coef_mod_c)
+  coef_mod_c$`Reference Group` <- ""
+  coef_mod_c <- coef_mod_c[c("coef", "Reference Group", "beta", "SE", "tstat", "df", "p_Satt")]
+  coef_mod_c$coef[which(coef_mod_c$coef=="intrcpt")] <- "Intercept"
+  coef_mod_c$coef[which(coef_mod_c$coef=="sub_ac_eng.c")] <- "Academic Engagement"
+  coef_mod_c$coef[which(coef_mod_c$coef=="sub_agg.c")] <- "Aggression/misconduct"
+  coef_mod_c$coef[which(coef_mod_c$coef=="sub_bul.c")] <- "Bullying"
+  coef_mod_c$coef[which(coef_mod_c$coef=="sub_disr.c")] <- "Disruptive Behavior"
+  coef_mod_c$coef[which(coef_mod_c$coef=="sub_drug.c")] <- "Drug/Alcohol Abuse"
+  coef_mod_c$coef[which(coef_mod_c$coef=="sub_empath.c")] <- "Empathy"
+  coef_mod_c$coef[which(coef_mod_c$coef=="sub_inter.c")] <- "Interpersonal Relationships"
+  coef_mod_c$coef[which(coef_mod_c$coef=="sub_prosoc.c")] <- "Prosocial Behavior"
+  coef_mod_c$coef[which(coef_mod_c$coef=="sub_climat.c")] <- "School Climate"
+  coef_mod_c$coef[which(coef_mod_c$coef=="sub_cope.c")] <- "Coping Skills/Stress Management"
+  coef_mod_c$coef[which(coef_mod_c$coef=="sub_emot.c")] <- "Emotional Regulation"
+  coef_mod_c$coef[which(coef_mod_c$coef=="sub_reduct.c")] <- "Reduction of Anxiety/Depression"
+  coef_mod_c$coef[which(coef_mod_c$coef=="universal.c")] <- "Universal"
+  coef_mod_c$coef[which(coef_mod_c$coef=="self_report_yes.c")] <- "Self-Report"
+  coef_mod_c$coef[which(coef_mod_c$coef=="Randomized.c")] <- "Randomized"
+  coef_mod_c$coef[which(coef_mod_c$coef=="Clustered.c")] <- "Cluster-level assignment"
+  coef_mod_c$`Reference Group`[which(coef_mod_c$coef=="Academic Engagement")] <- "Academic Performance"
+  coef_mod_c$`Reference Group`[which(coef_mod_c$coef=="Universal")] <- "Targeted"
+  coef_mod_c$`Reference Group`[which(coef_mod_c$coef=="Self-Report")] <- "Not Self-Report"
+  coef_mod_c$`Reference Group`[which(coef_mod_c$coef=="Randomized")] <- "QED"
+  coef_mod_c$`Reference Group`[which(coef_mod_c$coef=="Cluster-level assignment")] <- "Student-level assignment"
+  coef_mod_c <- plyr::rename(coef_mod_c, c("coef" = "Coefficients", "tstat" = "t", "p_Satt" = "p"))
+  
+  # Marginal Means Table
+  means <- plyr::rename(means, c("tstat" = "t", "p_Satt" = "p", "beta" = "ES"))
+  means$k <- ""
+  means$n <- ""
+  means$moderator[which(means$moderator=="(subcategory)")] <- "Outcome Subcategory"
+  means$moderator[which(means$moderator=="(uni_target)")] <- "Population"
+  means$moderator[which(means$moderator=="(self_report)")] <- "Self-Report"
+  means$moderator[which(means$moderator=="(Randomized)")] <- "Research Design"
+  means$moderator[which(means$moderator=="(Clustered)")] <- "Level of Assignment"
+  means$group[which(means$moderator=="Research Design" & means$group==0)] <- "QED"
+  means$group[which(means$moderator=="Research Design" & means$group==1)] <- "Randomized"
+  means$group[which(means$moderator=="Level of Assignment" & means$group==0)] <- "Student-level"
+  means$group[which(means$moderator=="Level of Assignment" & means$group==1)] <- "Cluster-level"
+  means <- means[c("moderator", "group", "k", "n", "ES", "SE", "t", "df", "p")]
+  
+  ########################################################################################################
+  # Save Output
+  ########################################################################################################
+  myreport <- body_add_par(x = myreport, value = name, style = "centered")
+
+  # Descriptive Table
+  myreport <- body_add_par(x = myreport, value = paste("Descriptives: ", name, sep = ""), style = "Normal")
+  descriptives_study <- flextable(head(table_study_df, n=nrow(table_study_df)))
+  descriptives_study <- add_header_lines(descriptives_study, values = c("Study Level"), top = FALSE)
+  descriptives_study <- theme_vanilla(descriptives_study)
+  myreport <- body_add_flextable(x = myreport, descriptives_study)
+  
+  descriptives_outcome <- flextable(head(table_outcome_df, n=nrow(table_outcome_df)))
+  descriptives_outcome <- delete_part(descriptives_outcome, part = "header")
+  descriptives_outcome <- add_header_lines(descriptives_outcome, values = c("Outcome Level"))
+  descriptives_outcome <- theme_vanilla(descriptives_outcome)
+  myreport <- body_add_flextable(x = myreport, descriptives_outcome)
+  myreport <- body_add_par(x = myreport, value = "", style = "Normal")
+  
+  # Meta-regression
+  model_null <- flextable(head(coef_null, n=nrow(coef_null)))
+  model_null <- colformat_num(x = model_null, j = c("beta", "SE", "t", "df"), digits = 2)
+  model_null <- colformat_num(x = model_null, j = c("p"), digits = 3)
+  #model_null <- autofit(model_null)
+  model_null <- add_header_lines(model_null, values = c("Null Model"), top = FALSE)
+  model_null <- theme_vanilla(model_null)
+  myreport <- body_add_par(x = myreport, value = paste("Meta-Regression Results: ", name, sep =""), style = "Normal")
+  myreport <- body_add_flextable(x = myreport, model_null)
+  
+  model_cont <- flextable(head(coef_mod_c, n=nrow(coef_mod_c)))
+  model_cont <- colformat_num(x = model_cont, j = c("beta", "SE", "t", "df"), digits = 2)
+  model_cont <- colformat_num(x = model_cont, j = c("p"), digits = 3)
+  #model_cont <- autofit(model_cont)
+  model_cont <- delete_part(model_cont, part = "header")
+  model_cont <- add_header_lines(model_cont, values = c("Meta-Regression"))
+  model_cont <- theme_vanilla(model_cont)
+  tablenote <- c("Note. SE=standard error; df=degrees of freedom")
+  model_cont <- add_footer_lines(model_cont, tablenote,)
+  myreport <- body_add_flextable(x = myreport, model_cont)
+  myreport <- body_add_par(x = myreport, value = "", style = "Normal")
+  
+  # Marginal means
+  mod_means <- flextable(head(means, n=nrow(means)))
+  mod_means <- colformat_num(x = mod_means, j = c("ES", "SE", "t", "df"), digits = 2)
+  mod_means <- colformat_num(x = mod_means, j = c("p"), digits = 3)
+  mod_means <- theme_vanilla(mod_means)
+  mod_means <- merge_v(x = mod_means, j = "moderator")
+  tablenote <- c("Note. k=number of studies; n = number of outcomes; ES=effect size; SE=standard error; df=degrees of freedom")
+  mod_means <- add_footer_lines(mod_means, tablenote,)
+
+  myreport <- body_add_par(x = myreport, value = "Moderator Means", style = "Normal")
+  myreport <- body_add_flextable(x = myreport, mod_means)
+  myreport <- body_add_par(x = myreport, value = "", style = "Normal")
+  
+}
+
+details <- function(df, name) {
+  # for local testing
+  # df <- acad
+  # name <- "Academic Outcomes"
+  
+  # format tables
+  df$Cite <- gsub("\\).*",")",df$Citation)
+  df$Design <- df$Design_forced
+  df$Design[which(df$Design=="Cluster randomized")] <- "CR"
+  df$Design[which(df$Design=="Cluster quasi-experiment")] <- "CQE"
+  df$Design[which(df$Design=="Student randomized")] <- "SR"
+  df$N <- paste(df$Sample, " students", sep = "")
+  df$N[which(df$Clustered==1)] <- paste(df$Clusters_Total[which(df$Clustered==1)], " ", df$cluster.unit[which(df$Clustered==1)], "\n", sep = "")
+  df$Sample <- df$sample_desc
+  df$Outcome <- df$Outcome_desc
+  df$Effect.Size <- round(df$Effect.Size, 2)
+  df$Effect.Size[which(df$Effect.Size>0)] <- paste("+", df$Effect.Size[which(df$Effect.Size>0)], sep = "")
+  df$Effect.Size[which(df$significant=="Yes")] <- paste(df$Effect.Size[which(df$significant=="Yes")], "*", sep = "")
+  
+  table <- df[c("Program", "Cite", "StudyID", "Design", 
+                "Grade", "Duration", "N", "Country", "Sample", 
+                "Outcome", "Effect.Size")]
+  table$merge <- paste(table$Program, table$Cite)
+  
+  # put in the right order (?)
+  table <- table[with(table, order(Program, StudyID, Cite, Outcome)), ]   
+  
+  #table_grouped <- as_grouped_data(x = table, groups = c("Program"))
+  table <- flextable(head(table, n=nrow(table)), col_keys = c("Program", "Cite", "StudyID", "Design", 
+                                                               "Grade", "Duration", "N", "Country", "Sample", 
+                                                               "Outcome", "Effect.Size"))
+  table <- theme_vanilla(table)
+  #table_grouped <- flextable(head(table_grouped))
+  table <- merge_v(table, j = ~ Program)
+  table <- merge_v(table, j = ~ merge, target = "Cite")
+  table <- merge_v(table, j = ~ StudyID, target = 3:7)
+  
+  myreport <- body_add_par(x = myreport, value = paste(name, " Studies", sep = ""), style = "Normal")
+  myreport <- body_add_flextable(x = myreport, table)
+  myreport <- body_add_par(x = myreport, value = "", style = "Normal")
+
+}
+
+```
+
+
+```{r}
+########################################################################################################
+# Analysis
+########################################################################################################
+# create report to hold output
+myreport <- officer::read_docx()
+
+#################################################################################
+# Descriptive Statistics
+#################################################################################
+describeBy(full$Effect.Size,full$targeted)
+describeBy(full$Effect.Size,full$Randomized)
+
+counts_by_category
+# total studies
+length(unique(full$StudyID))
+# number randomized
+length(unique(full$StudyID[which(full$Randomized==1)]))
+# number qed
+length(unique(full$StudyID[which(full$Randomized==0)]))
+
+counts <- data.frame(Category = character(0), Programs = numeric(0), Studies = numeric(0), ES = numeric(0))
+counts_by_category(acad, "Academic Outcomes")
+counts_by_category(prob, "Problem Behaviors")
+counts_by_category(relat, "Social Relationships")
+counts_by_category(emot, "Emotional Wellbeing")
+
+myreport <- body_add_par(x = myreport, value = "Included Studies", style = "Normal")
+myft <- flextable(head(counts, n=nrow(counts)))
+myreport <- body_add_flextable(x = myreport, myft)
+myreport <- body_add_par(x = myreport, value = "", style = "Normal")
+
+#################################################################################
+# Chinese Dragon
+#################################################################################
+# make Chinese Dragon (currently save to csv and make in Powerpoint)
+full_agg <- full[c("StudyID", "Year")]
+full_agg<-full_agg[!duplicated(full_agg$StudyID), ]   ### this one is for Chinese dragon figure
+ChineseDragon <- table(full_agg$Year)
+write.csv(ChineseDragon, "Output/ChineseDragon.csv")
+rm(ChineseDragon, full_agg)
+
+#################################################################################
+# Analyze data: calculate means by outcome category
+#################################################################################
+
+analyze(acad, "Academic Outcomes")
+analyze(prob, "Problem Behaviors")
+analyze(relat, "Social Relationships")
+analyze(emot, "Emotional Wellbeing")
+analyze(full, "All Studies")
+
+#################################################################################
+# Study/ES details
+#################################################################################
+details(acad, "Academic Outcomes")
+details(prob, "Problem Behaviors")
+details(relat, "Social Relationships")
+details(emot, "Emotional Wellbeing")
+
+########################################################################################################
+# Save Output
+########################################################################################################
+getwd()
+file = paste("SEL_Output.docx", sep = "")
+print(myreport, file)
+
+full <- full[with(full, order(Citation)), ]
+```
+
+
+```{r}
+##Will use dummy variables for 1) descriptive statistics and 2) marginal means
+
+# Create unique identifiers (ES, study)
+dfm$ESId <- as.numeric(rownames(dfm))
+dfm$StudyID <- as.numeric(as.factor(dfm$APA))
+
+# Make self-report variable a dummy
+dfm$`Self- Report` <- ifelse(dfm$`Self- Report` == "Yes", 1, 0)
+
+# Make MOOSES variable a dummy (with three categories: 1/2, 3/4, 5)
+dfm$Mooses.low <- 0
+dfm$Mooses.low[which(dfm$MOOSES=="1")] <- 1
+dfm$Mooses.low[which(dfm$MOOSES=="2")] <- 1
+
+dfm$Mooses.middle <- 0
+dfm$Mooses.middle[which(dfm$MOOSES=="3")] <- 1
+dfm$Mooses.middle[which(dfm$MOOSES=="4")] <- 1
+dfm$Mooses.middle[which(dfm$MOOSES=="4a")] <- 1
+dfm$Mooses.middle[which(dfm$MOOSES=="4b")] <- 1
+
+dfm$Mooses.high <- 0
+dfm$Mooses.high[which(dfm$MOOSES=="5")] <- 1
+
+# Make Gradeband a dummy
+dfm$Secondary <-0
+dfm$Secondary[which(dfm$Grade.Band=="Primary")]<-0
+dfm$Secondary[which(dfm$Grade.Band=="Secondary")]<-1
+
+
+# Make form of report a dummy (with five categories: teacher-report, parent-report, self-report, peer-report, third-party)
+dfm$teacher.report <- 0
+dfm$teacher.report[which(dfm$`Type of Measure`=="teacher-report")] <- 1
+
+dfm$parent.report <- 0
+dfm$parent.report[which(dfm$`Type of Measure`=="parent-report")] <- 1
+
+dfm$self.report <- 0
+dfm$self.report[which(dfm$`Type of Measure`=="self-report")] <- 1
+
+dfm$peer.report <- 0
+dfm$peer.report[which(dfm$`Type of Measure`=="peer-report")] <- 1
+
+dfm$third.party <- 0
+dfm$third.party[which(dfm$`Type of Measure`=="standardized assessment")] <- 1
+dfm$third.party[which(dfm$`Type of Measure`=="administrative records")] <- 1
+dfm$third.party[which(dfm$`Type of Measure`=="observation")] <- 1
+
+dfm$academic <- 0
+dfm$`Website Category`[which(dfm$`Website Category`=="Academic")] <- 1
+
+dfm$`Targeted Population`[which(dfm$`Targeted Population`=="Universal")] <- 0
+dfm$`Targeted Population`[which(dfm$`Targeted Population`=="Targeted")] <- 1
+
+dfm$targeted<-dfm$`Targeted Population`
+
+dfm$`Design_forced`[which(dfm$`Design_forced`=="Cluster randomized")] <- 0
+dfm$`Design_forced`[which(dfm$`Design_forced`=="Student randomized")] <- 0
+dfm$`Design_forced`[which(dfm$`Design_forced`=="Cluster quasi-experiment")] <- 1
+dfm$`Design_forced`[which(dfm$`Design_forced`=="Quasi-experiment")] <- 1
+
+dfm$qed<-dfm$Design_forced
+
+# Make qed and targeted numeric
+dfm$targeted = as.numeric(dfm$targeted)
+dfm$qed = as.numeric(dfm$qed)
+
+# Assign a 'clustered' dummy variable
+dfm$Clustered <- 0
+dfm$Clustered[which(dfm$Tx.Cluster !="")] <- 1
+
+# Center variables
+dfm$self.report.c <- dfm$`Self- Report` - mean(dfm$`Self- Report`)
+dfm$Mooses.low.c <- dfm$Mooses.low - mean(dfm$Mooses.low)
+dfm$Mooses.middle.c <- dfm$Mooses.middle - mean(dfm$Mooses.middle)
+dfm$Mooses.high.c <- dfm$Mooses.high - mean(dfm$Mooses.high)
+dfm$teacher.report.c <- dfm$teacher.report - mean(dfm$teacher.report)
+dfm$parent.report.c <- dfm$parent.report - mean(dfm$parent.report)
+dfm$self.report.c <- dfm$self.report - mean(dfm$self.report)
+dfm$peer.report.c <- dfm$peer.report - mean(dfm$peer.report)
+dfm$third.party.c <- dfm$third.party - mean(dfm$third.party)
+dfm$academic.c <- dfm$academic - mean(dfm$academic)
+dfm$secondary.c <- dfm$Secondary - mean(dfm$Secondary)
+dfm$targeted.c <- dfm$targeted - mean(dfm$targeted)
+dfm$qed.c <- dfm$qed - mean(dfm$qed)
+```
+
+```{r}
+# Covert all new values in columns to numeric
+dfm$Treatment.N = as.numeric(dfm$Tx.N)
+dfm$Control.N = as.numeric(dfm$Control.N)
+
+dfm$Treatment.Cluster = as.numeric(dfm$Tx.Cluster)
+dfm$Control.Cluster = as.numeric(dfm$Control.Cluster)
+
+
+# Sum the Full Sample of Participants and Clusters
+dfm$Sample <- dfm$Treatment.N + dfm$Control.N
+dfm$Clusters_Total <- dfm$Treatment.Cluster + dfm$Control.Cluster
+```
+
+```{r}
+# Changed the name so I can use Amanda's code
+full<-dfm 
+
+################################################################
+# Calculate meta-analytic variables: Correct ES for clustering (Hedges, 2007, Eq. 19)
+################################################################
+# first, create an assumed ICC
+full$icc <- NA
+full$icc[which(full$Clustered == 1)] <- 0.2   # could look this up and specify
+
+# find average students/cluster
+full$Treatment.Cluster.n <- NA
+full$Treatment.Cluster.n[which(full$Clustered == 1)] <- round(full$Treatment.N[which(full$Clustered == 1)]/full$Treatment.Cluster[which(full$Clustered == 1)], 0)
+full$Control.Cluster.n <- NA
+full$Control.Cluster.n[which(full$Clustered == 1)] <- round(full$Control.N[which(full$Clustered == 1)]/full$Control.Cluster[which(full$Clustered == 1)], 0)
+
+
+# find other parts of equation
+full$n.TU <- NA
+full$n.TU <- ((full$Treatment.N * full$Treatment.N) - (full$Treatment.Cluster * full$Treatment.Cluster.n * full$Treatment.Cluster.n))/(full$Treatment.N * (full$Treatment.Cluster - 1))
+full$n.CU <- NA
+full$n.CU <- ((full$Control.N * full$Control.N) - (full$Control.Cluster * full$Control.Cluster.n * full$Control.Cluster.n))/(full$Control.N * (full$Control.Cluster - 1))
+
+# next, calculate adjusted ES, save the originals, then replace only the clustered ones
+full$Effect.Size.adj <- full$ES2 * (sqrt(1-full$icc*(((full$Sample-full$n.TU*full$Treatment.Cluster - full$n.CU*full$Control.Cluster)+full$n.TU + full$n.CU - 2)/(full$Sample-2))))
+
+# save originals, replace for clustered
+full$Effect.Size.orig <- full$ES2
+full$Effect.Size[which(full$Clustered==1)] <- full$Effect.Size.adj[which(full$Clustered==1)]
+
+################################################################
+# Calculate meta-analytic variables: Variances (Lipsey & Wilson, 2000, Eq. 3.23)
+################################################################
+#calculate standard errors
+full$se<-sqrt(((full$Treatment.N+full$Control.N)/(full$Treatment.N*full$Control.N))+((full$ES2*full$ES2)/(2*(full$Treatment.N+full$Control.N))))
+
+#calculate variance
+full$var<-full$se*full$se
+
+################################################################
+# Calculate meta-analytic variables: Correct variance for clustering (Hedges, 2007, Eq. 20)
+################################################################
+# first, create an assumed ICC
+full$icc <- NA
+full$icc[which(full$Clustered == 1)] <- 0.2   
+
+# find average students/cluster
+full$Treatment.Cluster.n <- NA
+full$Treatment.Cluster.n[which(full$Clustered == 1)] <- round(full$Treatment.N[which(full$Clustered == 1)]/full$Treatment.Cluster[which(full$Clustered == 1)], 0)
+full$Control.Cluster.n <- NA
+full$Control.Cluster.n[which(full$Clustered == 1)] <- round(full$Control.N[which(full$Clustered == 1)]/full$Control.Cluster[which(full$Clustered == 1)], 0)
+
+# calculate the different parts of the formula (see Hedges 2007, equation)
+full$ntilde <- NA
+full$ntilde <- ((full$Control.N * full$Treatment.Cluster * full$Treatment.Cluster.n * full$Treatment.Cluster.n)/(full$Treatment.N * full$Sample)) +
+  ((full$Treatment.N * full$Control.Cluster * full$Control.Cluster.n * full$Control.Cluster.n)/(full$Control.N * full$Sample))
+
+full$n.TU <- NA
+full$n.TU <- ((full$Treatment.N * full$Treatment.N) - (full$Treatment.Cluster * full$Treatment.Cluster.n * full$Treatment.Cluster.n))/(full$Treatment.N * (full$Treatment.Cluster - 1))
+full$n.CU <- NA
+full$n.CU <- ((full$Control.N * full$Control.N) - (full$Control.Cluster * full$Control.Cluster.n * full$Control.Cluster.n))/(full$Control.N * (full$Control.Cluster - 1))
+
+full$AT <- NA
+full$AT <-((full$Treatment.N^2 * full$Treatment.Cluster * full$Treatment.Cluster.n^2) + ((full$Treatment.Cluster * full$Treatment.Cluster.n^2)^2) - (2 * full$Treatment.N * full$Treatment.Cluster.n^3 * full$Treatment.Cluster))/(full$Treatment.N^2)
+
+full$AC <- NA
+full$AC <-((full$Control.N^2 * full$Control.Cluster * full$Control.Cluster.n^2) + ((full$Control.Cluster * full$Control.Cluster.n^2)^2) - (2 * full$Control.N * full$Control.Cluster.n^3 * full$Control.Cluster))/(full$Control.N^2)
+
+full$A <- full$AT + full$AC
+
+full$B <- NA
+full$B <- full$n.TU * (full$Treatment.Cluster - 1) + full$n.CU * (full$Control.Cluster -1)
+
+full$var.adj <- NA
+full$var.adj <- ((full$Treatment.N + full$Control.N)/(full$Treatment.N * full$Control.N)) * (1 + (full$ntilde - 1) * full$icc) + ((((full$Sample - 2)*(1-full$icc)^2) + full$A * full$icc^2 + 2*full$icc*(1-full$icc))*full$ES2^2)/(2*(full$Sample-2)*((full$Sample - 2)-full$icc*(full$Sample-2-full$B)))
+full$var.old <- full$var
+full$var[which(full$Clustered == 1)] <- full$var.adj[which(full$Clustered == 1)]
+```
+
+
+```{r}
+################################################################
+# Estimate study-level effect sizes
+################################################################
+# create weighted ESs (for study-level ES calculations)
+# I chose to weight by sample size
+full$wes <- full$Effect.Size.adj * full$Sample
+full$totalweight <- full$Sample
+
+# for all studies: aggregate data to study-level, the re-combine
+study_levela <- unique(full[c("StudyID")])
+study_levelb <- aggregate(full[c("Clustered", "Treatment.N", "Control.N", "Treatment.Cluster", "Control.Cluster", "targeted.c", "qed.c")], by = list(full$StudyID), FUN = mean, na.rm = TRUE)
+study_levelb <- plyr::rename(study_levelb, c("Group.1" = "StudyID"))
+study_levelc <- aggregate(full$Effect.Size.adj, by = list(full$StudyID), FUN = length)
+study_levelc <- plyr::rename(study_levelc, c("x" = "num.findings", "Group.1" = "StudyID"))
+study_leveld <- aggregate(full[c("wes", "totalweight", 
+                                 "self.report.c", "Mooses.middle.c", "Mooses.high.c", "teacher.report.c", "parent.report.c",  "peer.report.c", "academic.c", "secondary.c" )], by = list(full$StudyID), FUN = sum, na.rm = TRUE)
+study_leveld <- plyr::rename(study_leveld, c("Group.1" = "StudyID"))
+study_level <- merge(study_levela, study_levelb, by = "StudyID", all = TRUE)
+study_level <- merge(study_level, study_levelc, by = "StudyID", all = TRUE)
+study_level <- merge(study_level, study_leveld, by = "StudyID", all = TRUE)
+
+rm(study_levela)
+rm(study_levelb)
+rm(study_levelc)
+rm(study_leveld)
+
+# create full sample/total clusters variables
+study_level$Sample <- study_level$Treatment.N + study_level$Control.N
+study_level$Clusters_Total <- study_level$Treatment.Cluster + study_level$Control.Cluster
+
+# create study-level ES
+study_level$Effect.Size <- study_level$wes/study_level$totalweight
+
+# calculate study-level variance
+#calculate standard errors
+study_level$se<-sqrt(((study_level$Treatment.N+study_level$Control.N)/(study_level$Treatment.N*study_level$Control.N))+((study_level$Effect.Size*study_level$Effect.Size)/(2*(study_level$Treatment.N+study_level$Control.N))))
+
+# calculate variance
+study_level$var<-study_level$se*study_level$se
+# correct variance for clustering
+# first, create an assumed ICC
+study_level$icc <- NA
+study_level$icc[which(study_level$Clustered == 1)] <- 0.2   # could look this up and specify
+
+# find average students/cluster
+study_level$Treatment.Cluster.n <- NA
+study_level$Treatment.Cluster.n[which(study_level$Clustered == 1)] <- round(study_level$Treatment.N[which(study_level$Clustered == 1)]/study_level$Treatment.Cluster[which(study_level$Clustered == 1)], 0)
+study_level$Control.Cluster.n <- NA
+study_level$Control.Cluster.n[which(study_level$Clustered == 1)] <- round(study_level$Control.N[which(study_level$Clustered == 1)]/study_level$Control.Cluster[which(study_level$Clustered == 1)], 0)
+
+# calculate the different parts of the formula (see Hedges 2007, equation)
+study_level$ntilde <- NA
+study_level$ntilde <- ((study_level$Control.N * study_level$Treatment.Cluster * study_level$Treatment.Cluster.n * study_level$Treatment.Cluster.n)/(study_level$Treatment.N * study_level$Sample)) +
+  ((study_level$Treatment.N * study_level$Control.Cluster * study_level$Control.Cluster.n * study_level$Control.Cluster.n)/(study_level$Control.N * study_level$Sample))
+
+study_level$n.TU <- NA
+study_level$n.TU <- ((study_level$Treatment.N * study_level$Treatment.N) - (study_level$Treatment.Cluster * study_level$Treatment.Cluster.n * study_level$Treatment.Cluster.n))/(study_level$Treatment.N * (study_level$Treatment.Cluster - 1))
+study_level$n.CU <- NA
+study_level$n.CU <- ((study_level$Control.N * study_level$Control.N) - (study_level$Control.Cluster * study_level$Control.Cluster.n * study_level$Control.Cluster.n))/(study_level$Control.N * (study_level$Control.Cluster - 1))
+
+study_level$AT <- NA
+study_level$AT <-((study_level$Treatment.N^2 * study_level$Treatment.Cluster * study_level$Treatment.Cluster.n^2) + ((study_level$Treatment.Cluster * study_level$Treatment.Cluster.n^2)^2) - (2 * study_level$Treatment.N * study_level$Treatment.Cluster.n^3 * study_level$Treatment.Cluster))/(study_level$Treatment.N^2)
+
+study_level$AC <- NA
+study_level$AC <-((study_level$Control.N^2 * study_level$Control.Cluster * study_level$Control.Cluster.n^2) + ((study_level$Control.Cluster * study_level$Control.Cluster.n^2)^2) - (2 * study_level$Control.N * study_level$Control.Cluster.n^3 * study_level$Control.Cluster))/(study_level$Control.N^2)
+
+study_level$A <- study_level$AT + study_level$AC
+
+study_level$B <- NA
+study_level$B <- study_level$n.TU * (study_level$Treatment.Cluster - 1) + study_level$n.CU * (study_level$Control.Cluster -1)
+
+study_level$var.adj <- NA
+study_level$var.adj <- ((study_level$Treatment.N + study_level$Control.N)/(study_level$Treatment.N * study_level$Control.N)) * (1 + (study_level$ntilde - 1) * study_level$icc) + ((((study_level$Sample - 2)*(1-study_level$icc)^2) + study_level$A * study_level$icc^2 + 2*study_level$icc*(1-study_level$icc))*study_level$Effect.Size^2)/(2*(study_level$Sample-2)*((study_level$Sample - 2)-study_level$icc*(study_level$Sample-2-study_level$B)))
+study_level$var.old <- study_level$var
+study_level$var[which(study_level$Clustered == 1)] <- study_level$var.adj[which(study_level$Clustered == 1)]
+```
+
+```{r}
+# RVE; Null Model
+# estimate a covariance matrix
+V_list <-impute_covariance_matrix(vi = full$var.adj, 
+                                  cluster = full$StudyID, 
+                                  r = 0.8)
+
+MVnull <- rma.mv(yi =Effect.Size.adj, 
+                 V= V_list, 
+                 random = ~1 | StudyID/ESId, 
+                 test = "t", 
+                 data = full, 
+                 method = "REML")
+MVnull
+
+MVnull.coef <- coef_test(MVnull, 
+                         cluster=full$StudyID, 
+                         vcov = "CR2") 
+MVnull.coef
+
+# RVE: Metaregression (Centered)
+# Reference categories are: MOOSES low and self-report
+terms <- c( "Mooses.middle.c", "Mooses.high.c","self.report.c", "teacher.report.c", "parent.report.c","peer.report.c","academic.c","secondary.c")
+
+formula <- reformulate(termlabels = c(terms))
+
+MVfull <- rma.mv(yi=Effect.Size.adj, 
+                 V=V_list, 
+                 mods = formula, 
+                 random = ~1 | StudyID/ESId, 
+                 test="t", 
+                 data=full, 
+                 method="REML")
+MVfull
+
+# t-tests of each covariate
+MVfull.coef <- coef_test(MVfull,#estimation model above
+                         cluster=full$StudyID, #define cluster IDs
+                         vcov = "CR2") #estimation method (CR2 is best)
+MVfull.coef
+
+
+################################################################################
+# RVE: Metaregression 2: No centering w/ intercept
+###############################################################################
+
+# save list of moderators to include
+terms <- c("Mooses.middle","Mooses.high","self.report",
+           "teacher.report", "parent.report", "peer.report", "academic", "Secondary", "targeted", "qed")  
+
+# format moderators into formula (an R-specific type)
+formula <- reformulate(termlabels = c(terms))
+
+MVfull.uncent <- rma.mv(yi=Effect.Size.adj, #effect size
+                 V = V_list, #variance (tHIS IS WHAt CHANGES FROM HEmodel)
+                 mods = formula, #ADD COVS HERE
+                 random = ~1 | StudyID/ESId, #nesting structure
+                 test= "t", #use t-tests
+                 data=full, #define data
+                 method="REML") #estimate variances using REML
+MVfull.uncent
+
+#t-tests of each covariate #
+MVfull.uncent.coef <- coef_test(MVfull.uncent,#estimation model above
+                         cluster=full$StudyID, #define cluster IDs
+                         vcov = "CR2") #estimation method (CR2 is best)
+MVfull.uncent.coef
+```
+
+```{r}
+#################################################################################
+# Empirical Bayes
+#################################################################################
+# 95% prediction intervals
+PI_upper <- MVfull$b[1] + (1.96*sqrt(MVfull$sigma2[1] + MVfull$sigma2[2]))
+PI_lower <- MVfull$b[1] - (1.96*sqrt(MVfull$sigma2[1] + MVfull$sigma2[2]))
+PI_upper
+PI_lower
+
+# Get empirical bayes estimates of each effect size
+blup_mod <- ranef(MVfull)
+full$blup_ES <- blup_mod$`StudyID/ESId`$intrcpt
+
+blup_Study <- blup_mod$StudyID
+blup_Study$StudyID <- as.numeric(row.names(data.frame(blup_Study)))
+
+fixed_ES <- predict(MVfull)
+fixed_ES <- as.data.frame(fixed_ES$pred)
+fixed_ES$StudyID <- as.numeric(row.names(data.frame(fixed_ES)))
+
+#now merge Study.ID blups into data
+data_m <- merge(full, blup_Study, by = "StudyID")
+data_m <- merge(data_m, fixed_ES, by = "StudyID")
+
+#put together to get EB: fixed + Study BLUP + ES BLUP
+data_m$grandmean <- as.numeric(coef(MVfull)[1])
+
+data_m$blup_all <- data_m$grandmean + data_m$blup_ES + data_m$intrcpt
+# this section combines all 3 pieces
+
+k = length(data_m$Effect.Size)# number of studies (OR EFFECT SIZES?)
+#create a dataframe with observed effect sizes and emprical bayes estimates
+
+ES_EB = data.frame(es = c(data_m$Effect.Size.adj, data_m$blup_all), type = rep(c('Observed', 'Empirical Bayes'), each = k))
+ES_EB$type = factor(ES_EB$type, levels = c('Observed', 'Empirical Bayes'))
+
+EB_plot <- ggplot(ES_EB) +
+  geom_rect(aes(xmin=PI_lower, xmax=PI_upper, ymin=-Inf, ymax=Inf), alpha=0.01, fill="grey") +
+  stat_density(aes(es, group = type, colour = type), geom="line",position="identity", size=1) +
+  geom_vline(aes(xintercept = coef(MVfull)[1]), color="black", linetype="dashed") +
+  labs(x = 'Effect Sizes', y = 'Density') + #, title = 'Distribution of Effect Sizes') +
+  expand_limits(x=c(-0.5,1.25), y=c(0,2.7)) +
+  theme(
+    plot.title = element_text(color="black", size=14, face="bold", hjust = 0.5),
+    axis.title.x = element_text(color="black", size=12, face="bold"),
+    axis.title.y = element_text(color="black", size=12, face="bold"),
+    legend.position = c(.95, .95),
+    legend.justification = c("right", "top"),
+    legend.box.just = "right",
+    legend.margin = margin(0, 2, 2, 2),
+    legend.title = element_blank(),
+    legend.text=element_text(size=9, face="bold")
+  ) + theme_minimal() + theme(legend.position="bottom")
+
+EB_plot
+```
+
+```{r}
+# Output
+test<-require(tableone)
+if(test ==FALSE) {
+  install.packages("tableone")
+  require(tableone)
+}
+
+rm(test)
+
+# For descriptives, you will make two 'chunks' - one for study-level variables, and one for outcome-level variables.
+
+# identify variables for descriptive tables (study-level and outcome-level)
+vars_study <- c("targeted.c", "qed.c")
+vars_outcome <- c("Mooses.middle.c", "Mooses.high.c","self.report.c", "teacher.report.c", "parent.report.c","peer.report.c","academic.c","secondary.c")
+
+#To make this work, you will need a df that is at the study-level for study-level variables. You have already created this here: 
+study_level_full <- full[c("StudyID", "targeted.c", "qed.c")]
+study_level_full<- unique(study_level_full)
+length(study_level_full$StudyID)== length(unique(study_level_full$StudyID))
+
+# create the table 'chunks'
+table_study_df <- as.data.frame(print(CreateTableOne(vars=vars_study, data=study_level_full, includeNA=TRUE,factorVars = c("targeted.c", "qed.c")), 
+                                      showAllLevels=TRUE))
+
+table_outcome_df <- as.data.frame(print(CreateTableOne(vars = vars_outcome, data = full, includeNA=TRUE), showAllLevels=TRUE))
+
+rm(vars_study, vars_outcome)
+
+# Then you can save it (this week as a .csv, next week as a .doc)
+write.table(table_study_df, "table1_raw.csv", append = FALSE, sep = ",")
+write.table(table_outcome_df, "table1_raw.csv", append = TRUE, sep = ",")
+
+# You may want to do some formatting to make it "prettier" [OPTIONAL]
+
+
+########################################################################################################
+# Formatting Output
+########################################################################################################
+# You may want to do some formatting to make it "prettier" [OPTIONAL]
+# Descriptives Table Formatting
+table_study_df$Category <- row.names(table_study_df)
+rownames(table_study_df) <- c()
+table_study_df <- table_study_df[c("Category", "level", "Overall")]
+table_study_df$Category[which(substr(table_study_df$Category, 1, 1)=="X")] <- NA
+table_study_df$Category <- gsub(pattern = "\\..mean..SD..", replacement = "", x = table_study_df$Category)
+table_study_df$Overall <- gsub(pattern = "\\( ", replacement = "\\(", x = table_study_df$Overall)
+table_study_df$Overall <- gsub(pattern = "\\) ", replacement = "\\)", x = table_study_df$Overall)
+table_study_df$Category <- gsub(pattern = "\\.", replacement = "", x = table_study_df$Category)
+table_study_df$Category[which(table_study_df$Category=="n")] <- "Total Studies"
+table_study_df$Category[which(table_study_df$Category=="targeted.c")] <- "targeted"
+table_study_df$Category[which(table_study_df$Category=="qed.c")] <- "Quasi-Experimental Design"
+table_study_df$level[which(table_study_df$level=="1")] <- "Yes"
+table_study_df$level[which(table_study_df$level=="0")] <- "No                                                                              "
+# fill in blank columns (to improve merged cells later)
+for(i in 1:length(table_study_df$Category)) {
+  if(is.na(table_study_df$Category[i])) {
+    table_study_df$Category[i] <- table_study_df$Category[i-1]
+  }
+}
+
+table_outcome_df$Category <- row.names(table_outcome_df)
+rownames(table_outcome_df) <- c()
+table_outcome_df <- table_outcome_df[c("Category", "level", "Overall")]
+table_outcome_df$Category[which(substr(table_outcome_df$Category, 1, 1)=="X")] <- NA
+table_outcome_df$Overall <- gsub(pattern = "\\( ", replacement = "\\(", x = table_outcome_df$Overall)
+table_outcome_df$Overall <- gsub(pattern = "\\) ", replacement = "\\)", x = table_outcome_df$Overall)
+table_outcome_df$Category <- gsub(pattern = "\\.", replacement = "", x = table_outcome_df$Category)
+table_outcome_df$Category[which(table_outcome_df$Category=="n")] <- "Total Effect Sizes"
+# fill in blank columns (to improve merged cells later)
+for(i in 1:length(table_outcome_df$Category)) {
+  if(is.na(table_outcome_df$Category[i])) {
+    table_outcome_df$Category[i] <- table_outcome_df$Category[i-1]
+  }
+}
+
+# MetaRegression Table
+MVnull.coef
+str(MVnull.coef)
+MVnull.coef$coef <- row.names(as.data.frame(MVnull.coef))
+row.names(MVnull.coef) <- c()
+MVnull.coef <- MVnull.coef[c("coef", "beta", "SE", "tstat", "df", "p_Satt")]
+
+MVfull.coef$coef <- row.names(as.data.frame(MVfull.coef))
+row.names(MVfull.coef) <- c()
+MVfull.coef <- MVfull.coef[c("coef", "beta", "SE", "tstat", "df", "p_Satt")]
+
+########################################################################################################
+# Saving Output
+########################################################################################################
+# Then you can save it (last week as a .csv, this week as a .doc [below])
+write.table(table_study_df, "table1_pretty.csv", append = FALSE, sep = ",", row.names = FALSE)
+write.table(table_outcome_df, "table1_pretty.csv", append = TRUE, sep = ",", row.names = FALSE)
+
+myreport <- read_docx()
+
+# MetaRegression Table
+model_null <- flextable(head(MVnull.coef, n=nrow(MVnull.coef)))
+colkeys <- c("beta", "SE", "tstat", "df")
+model_null <- colformat_num(model_null,  j = colkeys, digits = 2)
+model_null <- colformat_num(model_null,  j = c("p_Satt"), digits = 3)
+#model_null <- autofit(model_null)
+model_null <- add_header_lines(model_null, values = c("Null Model"), top = FALSE)
+model_null <- theme_vanilla(model_null)
+
+myreport <- body_add_par(x = myreport, value = "Table 2: Model Results", style = "Normal")
+myreport <- body_add_flextable(x = myreport, model_null)
+#myreport <- body_add_par(x = myreport, value = "", style = "Normal")
+
+model_full <- flextable(head(MVfull.coef, n=nrow(MVfull.coef)))
+model_full <- colformat_num(model_full,  j = colkeys, digits = 2)
+model_full <- colformat_num(model_full,  j = c("p_Satt"), digits = 3)
+#model_full <- autofit(model_full)
+model_full <- delete_part(model_full, part = "header")
+model_full <- add_header_lines(model_full, values = c("Meta-Regression"))
+model_full <- theme_vanilla(model_full)
+
+myreport <- body_add_flextable(x = myreport, model_full)
+myreport <- body_add_par(x = myreport, value = "", style = "Normal")
+
+# Descriptive Table
+myreport <- body_add_par(x = myreport, value = "Table 1: Descriptives", style = "Normal")
+descriptives_study <- flextable(head(table_study_df, n=nrow(table_study_df)))
+descriptives_study <- add_header_lines(descriptives_study, values = c("Study Level"), top = FALSE)
+descriptives_study <- theme_vanilla(descriptives_study)
+
+myreport <- body_add_flextable(x = myreport, descriptives_study)
+
+descriptives_outcome <- flextable(head(table_outcome_df, n=nrow(table_outcome_df)))
+descriptives_outcome <- delete_part(descriptives_outcome, part = "header")
+descriptives_outcome <- add_header_lines(descriptives_outcome, values = c("Outcome Level"))
+descriptives_outcome <- theme_vanilla(descriptives_outcome)
+
+myreport <- body_add_flextable(x = myreport, descriptives_outcome)
+myreport <- body_add_par(x = myreport, value = "", style = "Normal")
+
+# Write to word doc
+file = paste("TableResults.docx", sep = "")
+print(myreport, file)
+```
+
